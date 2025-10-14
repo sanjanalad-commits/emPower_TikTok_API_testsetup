@@ -1,0 +1,26 @@
+# Core Dependencies
+requests==2.31.0
+google-cloud-bigquery==3.11.4
+google-cloud-secret-manager==2.16.3
+google-auth==2.23.0
+
+# Data Processing
+pandas==2.1.1
+numpy==1.24.3
+
+# API & Web Framework (for Cloud Run)
+fastapi==0.103.1
+uvicorn[standard]==0.23.2
+pydantic==2.4.2
+
+# Utilities
+python-dateutil==2.8.2
+pytz==2023.3
+
+# Logging & Monitoring
+python-json-logger==2.0.7
+
+# Testing (optional, for development)
+pytest==7.4.2
+pytest-mock==3.11.1
+responses==0.23.3
