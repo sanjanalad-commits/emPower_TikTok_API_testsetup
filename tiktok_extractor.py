@@ -1,14 +1,19 @@
+"""
+TikTok Marketing API Extractor - Clean Version
+"""
+
 import requests
 import json
 from datetime import datetime, timedelta
 from typing import List, Dict
+import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
-import pandas as pd
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 class TikTokExtractor:
     def __init__(self, app_id: str, app_secret: str, access_token: str, advertiser_id: str):
@@ -19,139 +24,140 @@ class TikTokExtractor:
         self.base_url = "https://business-api.tiktok.com/open_api/v1.3"
 
     def extract_report_data(self, start_date: str, end_date: str) -> pd.DataFrame:
-        all_chunks = []
-        current_start = datetime.strptime(start_date, "%Y-%m-%d")
-        end_date_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        all_data = []
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
 
-        while current_start <= end_date_dt:
-            current_end = min(current_start + timedelta(days=29), end_date_dt)
-            chunk_start = current_start.strftime("%Y-%m-%d")
-            chunk_end = current_end.strftime("%Y-%m-%d")
-            print(f"Fetching chunk: {chunk_start} → {chunk_end}")
+        while start <= end:
+            chunk_end = min(start + timedelta(days=29), end)
+            s_date = start.strftime("%Y-%m-%d")
+            e_date = chunk_end.strftime("%Y-%m-%d")
+            logger.info(f"Fetching chunk: {s_date} to {e_date}")
 
-            endpoint = f"{self.base_url}/report/integrated/get/"
-            headers = {"Access-Token": self.access_token}
             params = {
                 "advertiser_id": self.advertiser_id,
                 "report_type": "BASIC",
-                "dimensions": '["campaign_id","adgroup_id","ad_id","stat_time_day"]',
+                "dimensions": '["ad_id","stat_time_day"]',
                 "metrics": '["spend","impressions","clicks","ctr","cpm","cpc","reach","frequency","video_play_actions","video_watched_2s","video_watched_6s","average_video_play"]',
                 "data_level": "AUCTION_AD",
-                "start_date": chunk_start,
-                "end_date": chunk_end,
+                "start_date": s_date,
+                "end_date": e_date,
                 "page_size": 1000,
                 "page": 1
             }
 
-            chunk_data = []
-
-            try:
-                while True:
-                    logger.info(f"Fetching TikTok data - Page {params['page']} for {chunk_start} → {chunk_end}")
-                    response = requests.get(endpoint, headers=headers, params=params)
+            chunk_rows = 0
+            while True:
+                try:
+                    response = requests.get(
+                        f"{self.base_url}/report/integrated/get/",
+                        headers={"Access-Token": self.access_token},
+                        params=params
+                    )
                     response.raise_for_status()
                     result = response.json()
 
                     if result.get("code") != 0:
-                        error_msg = result.get("message", "Unknown error")
-                        logger.error(f"TikTok API error: {error_msg}")
-                        raise Exception(f"TikTok API returned error: {error_msg}")
+                        logger.error(f"TikTok API error: {result.get('message')}")
+                        break
 
                     page_data = result.get("data", {}).get("list", [])
                     if not page_data:
                         break
-
-                    chunk_data.extend(page_data)
+                        
+                    all_data.extend(page_data)
+                    chunk_rows += len(page_data)
 
                     page_info = result.get("data", {}).get("page_info", {})
-                    total_page = page_info.get("total_page", 1)
-                    if params["page"] >= total_page:
+                    total_pages = page_info.get("total_page", 1)
+                    
+                    if params["page"] >= total_pages:
                         break
                     params["page"] += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error fetching chunk {s_date} to {e_date}: {e}")
+                    break
 
-                if chunk_data:
-                    all_chunks.extend(chunk_data)
-                    logger.info(f"Fetched {len(chunk_data)} rows for {chunk_start} → {chunk_end}")
+            logger.info(f"Chunk {s_date} to {e_date}: Fetched {chunk_rows} rows")
+            start = chunk_end + timedelta(days=1)
 
-            except Exception as e:
-                logger.error(f"Error fetching chunk {chunk_start} → {chunk_end}: {e}")
-
-            current_start = current_end + timedelta(days=1)
-
-        if not all_chunks:
-            print("No data returned from TikTok API")
+        logger.info(f"TOTAL ROWS FETCHED: {len(all_data)}")
+        
+        if not all_data:
+            logger.warning("NO DATA returned from TikTok API")
             return pd.DataFrame()
 
-        ad_ids = [row.get("dimensions", {}).get("ad_id") for row in all_chunks if row.get("dimensions", {}).get("ad_id")]
+        ad_ids = [str(row["dimensions"]["ad_id"]) for row in all_data if row.get("dimensions", {}).get("ad_id")]
+        logger.info(f"Fetching details for {len(set(ad_ids))} unique ads")
+        
         ad_details = self._get_ad_details(list(set(ad_ids)))
-        df = self._transform_to_dataframe(all_chunks, ad_details)
-        print(f"Extracted total {len(df)} rows across all chunks")
+        df = self._transform_to_dataframe(all_data, ad_details)
+        
+        logger.info(f"Final DataFrame: {len(df)} rows")
         return df
 
     def _get_ad_details(self, ad_ids: List[str]) -> Dict[str, Dict]:
-        if not ad_ids:
-            return {}
+        """Fetch ad details"""
+        ad_details = {}
         endpoint = f"{self.base_url}/ad/get/"
         headers = {"Access-Token": self.access_token}
-        ad_details = {}
-        batch_size = 100
-        for i in range(0, len(ad_ids), batch_size):
-            batch_ids = ad_ids[i:i + batch_size]
+
+        for i in range(0, len(ad_ids), 100):
+            batch_ids = ad_ids[i:i + 100]
+            
             params = {
                 "advertiser_id": self.advertiser_id,
                 "filtering": json.dumps({"ad_ids": batch_ids}),
-                "fields": '["ad_id","ad_name","adgroup_id","adgroup_name","campaign_id","campaign_name","ad_text","call_to_action","creative_material_mode"]'
+                "fields": '["ad_id","ad_name","adgroup_id","adgroup_name","campaign_id","campaign_name","ad_text","call_to_action","ad_format","creative_type"]'
             }
+            
             try:
                 response = requests.get(endpoint, headers=headers, params=params)
                 result = response.json()
+                
                 if result.get("code") == 0:
                     ads = result.get("data", {}).get("list", [])
                     for ad in ads:
-                        ad_details[str(ad["ad_id"])] = ad
+                        ad_id = str(ad["ad_id"])
+                        ad_details[ad_id] = ad
+                        logger.info(f"Got ad: {ad.get('ad_name')} - Campaign: {ad.get('campaign_name')}")
+                else:
+                    logger.warning(f"Ad details API error: {result.get('message')}")
+                    
             except Exception as e:
-                logger.warning(f"Could not fetch ad details for batch: {e}")
-                continue
+                logger.warning(f"Failed to fetch ad details batch: {e}")
+                
+        logger.info(f"Fetched details for {len(ad_details)} ads")
         return ad_details
 
     def _transform_to_dataframe(self, raw_data: List[Dict], ad_details: Dict[str, Dict]) -> pd.DataFrame:
+        """Transform TikTok API response to DataFrame"""
         records = []
+        
         for row in raw_data:
             ad_id = str(row.get("dimensions", {}).get("ad_id", ""))
             ad_info = ad_details.get(ad_id, {})
             metrics = row.get("metrics", {})
 
-            try:
-                video_views = int(metrics.get("video_play_actions", 0))
-            except:
-                video_views = 0
-            try:
-                video_2s = int(metrics.get("video_watched_2s", 0))
-            except:
-                video_2s = 0
-            try:
-                video_6s = int(metrics.get("video_watched_6s", 0))
-            except:
-                video_6s = 0
-            try:
-                spend = float(metrics.get("spend", 0))
-            except:
-                spend = 0.0
-            try:
-                reach = int(metrics.get("reach", 0))
-            except:
-                reach = 0
+            video_views = int(metrics.get("video_play_actions", 0))
+            video_2s = int(metrics.get("video_watched_2s", 0))
+            video_6s = int(metrics.get("video_watched_6s", 0))
+            spend = float(metrics.get("spend", 0))
+            reach = int(metrics.get("reach", 0))
 
-            record = {
+            format_value = ad_info.get("ad_format", ad_info.get("creative_type", "VIDEO"))
+
+            records.append({
                 'DATE': row.get("dimensions", {}).get("stat_time_day"),
                 'VIDEO_AVERAGE_PLAY_TIME': float(metrics.get("average_video_play", 0)),
-                'FORMAT': ad_info.get("creative_material_mode", "VIDEO"),
-                'VIDEO_VIEWS_AT_50': video_6s if video_6s else None,
+                'FORMAT': format_value,
+                'VIDEO_VIEWS_AT_50': video_6s or None,
                 'FREQUENCY': float(metrics.get("frequency", 0)),
                 'AMOUNT_SPENT_USD': spend,
                 'VIDEO_VIEWS_AT_75': int(video_views * 0.75) if video_views else None,
-                'VIDEO_VIEWS_AT_25': video_2s if video_2s else None,
-                'CPR': round(spend / reach, 6) if reach > 0 else None,
+                'VIDEO_VIEWS_AT_25': video_2s or None,
+                'CPR': round(spend / reach, 6) if reach else None,
                 'REACH': reach,
                 'CTR_DESTINATION': float(metrics.get("ctr", 0)),
                 'CURRENCY': "USD",
@@ -168,20 +174,22 @@ class TikTokExtractor:
                 'VIDEO_VIEWS_AT_100': video_views if video_views else None,
                 'VIDEO_VIEWS': video_views,
                 'AD_GROUP_NAME': ad_info.get("adgroup_name", ""),
-                'CAMPAIGN_NAME': ad_info.get("campaign_name", ""),
-            }
-            records.append(record)
+                'CAMPAIGN_NAME': ad_info.get("campaign_name", "")
+            })
 
         df = pd.DataFrame(records)
-        df['DATE'] = pd.to_datetime(df['DATE'])
+        if not df.empty:
+            df['DATE'] = pd.to_datetime(df['DATE'])
         return df
 
 
 class DataTransformer:
     @staticmethod
     def transform(df: pd.DataFrame) -> pd.DataFrame:
+        """Clean and transform data"""
         if df.empty:
             return df
+            
         df = df.fillna({
             'VIDEO_AVERAGE_PLAY_TIME': 0.0,
             'FORMAT': 'VIDEO',
@@ -201,54 +209,45 @@ class DataTransformer:
             'AD_GROUP_NAME': '',
             'CAMPAIGN_NAME': '',
         })
-        numeric_columns = {
-            'VIDEO_AVERAGE_PLAY_TIME': float,
-            'FREQUENCY': float,
-            'AMOUNT_SPENT_USD': float,
-            'CPR': float,
-            'CTR_DESTINATION': float,
-            'CPM': float,
-            'CPC_DESTINATION': float,
-            'REACH': int,
-            'IMPRESSIONS': int,
-            'LINK_CLICKS': int,
-            'VIDEO_VIEWS': int,
-        }
-        for col, dtype in numeric_columns.items():
-            if col in df.columns:
-                df[col] = df[col].astype(dtype)
         return df
 
 
 class BigQueryLoader:
     def __init__(self, project_id: str, dataset_id: str, credentials_path: str):
+        credentials = service_account.Credentials.from_service_account_file(credentials_path)
+        self.client = bigquery.Client(credentials=credentials, project=project_id)
         self.project_id = project_id
         self.dataset_id = dataset_id
-        credentials = service_account.Credentials.from_service_account_file(
-            credentials_path,
-            scopes=['https://www.googleapis.com/auth/bigquery']
-        )
-        self.client = bigquery.Client(credentials=credentials, project=project_id)
 
     def delete_existing_dates(self, df: pd.DataFrame, table_name: str = "TIKTOKREPORT_RAW"):
+        """Delete existing data for dates being loaded (prevents duplicates)"""
         if df.empty:
             return
+            
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
         dates = df['DATE'].dt.strftime('%Y-%m-%d').unique()
         dates_str = "', '".join(dates)
-        delete_query = f"DELETE FROM `{table_id}` WHERE DATE IN ('{dates_str}')"
+        query = f"DELETE FROM `{table_id}` WHERE DATE IN ('{dates_str}')"
+        
         try:
-            self.client.query(delete_query).result()
+            self.client.query(query).result()
+            print(f"Deleted existing data for {len(dates)} dates")
         except Exception as e:
             if "Not found" not in str(e):
                 print(f"Warning deleting existing dates: {e}")
 
     def load_to_bigquery(self, df: pd.DataFrame, table_name: str = "TIKTOKREPORT_RAW"):
+        """Load data to BigQuery"""
         if df.empty:
-            print("No data to load")
+            print("No data to load to BigQuery")
             return
+            
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
+        
+        # Delete existing dates first
         self.delete_existing_dates(df, table_name)
+        
+        # Load new data
         job_config = bigquery.LoadJobConfig(
             write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
             schema=[
@@ -278,24 +277,52 @@ class BigQueryLoader:
                 bigquery.SchemaField("VIDEO_VIEWS", "INTEGER"),
                 bigquery.SchemaField("AD_GROUP_NAME", "STRING"),
                 bigquery.SchemaField("CAMPAIGN_NAME", "STRING"),
-            ],
+            ]
         )
+        
         self.client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
+        print(f"Loaded {len(df)} rows to BigQuery")
+        
+        # Show summary
+        table = self.client.get_table(table_id)
+        print(f"Table now has {table.num_rows} total rows")
 
 
-def run_etl_pipeline(app_id, app_secret, access_token, advertiser_id, project_id, dataset_id, credentials_path, start_date, end_date):
+def run_etl_pipeline(app_id, app_secret, access_token, advertiser_id, 
+                     project_id, dataset_id, credentials_path, 
+                     start_date, end_date):
+    """Run the complete ETL pipeline"""
+    print("="*60)
+    print("TikTok ETL Pipeline Starting")
+    print("="*60)
+    print(f"Date range: {start_date} to {end_date}")
+    print(f"Advertiser ID: {advertiser_id}")
+    print(f"Target: {project_id}.{dataset_id}.TIKTOKREPORT_RAW")
+    print("="*60)
+    
+    # Extract
     extractor = TikTokExtractor(app_id, app_secret, access_token, advertiser_id)
     raw_data = extractor.extract_report_data(start_date, end_date)
+    
     if raw_data.empty:
-        print("No data extracted")
+        print("ERROR: No data extracted - check logs above")
         return
+    
+    # Transform
     transformer = DataTransformer()
     transformed_data = transformer.transform(raw_data)
+    
+    # Load
     loader = BigQueryLoader(project_id, dataset_id, credentials_path)
     loader.load_to_bigquery(transformed_data)
+    
+    print("="*60)
+    print("Pipeline Completed Successfully")
+    print("="*60)
 
 
 if __name__ == "__main__":
+    # YOUR CREDENTIALS
     TIKTOK_APP_ID = "7561256923966750737"
     TIKTOK_APP_SECRET = "01264ebfd0692d7c6556ab59992f2d292440977f"
     TIKTOK_ACCESS_TOKEN = "0417fb1524306e61a8a5d18426d5f6f4daebb5c6"
@@ -305,31 +332,18 @@ if __name__ == "__main__":
     DATASET_ID = "empower_api_data"
     CREDENTIALS_PATH = "./service-account-key.json"
 
-    last_run_file = "./last_run.txt"
-    try:
-        with open(last_run_file, "r") as f:
-            last_run_date = datetime.strptime(f.read().strip(), "%Y-%m-%d")
-    except:
-        last_run_date = datetime(2025, 3, 3)
+    # Date range - Full backfill from March 3
+    START_DATE = "2025-03-03"
+    END_DATE = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    end_date = datetime.now() - timedelta(days=1)
-    start_date = last_run_date + timedelta(days=1)
-
-    if start_date > end_date:
-        print("No new data to fetch")
-    else:
-        START_DATE = start_date.strftime("%Y-%m-%d")
-        END_DATE = end_date.strftime("%Y-%m-%d")
-        run_etl_pipeline(
-            app_id=TIKTOK_APP_ID,
-            app_secret=TIKTOK_APP_SECRET,
-            access_token=TIKTOK_ACCESS_TOKEN,
-            advertiser_id=TIKTOK_ADVERTISER_ID,
-            project_id=PROJECT_ID,
-            dataset_id=DATASET_ID,
-            credentials_path=CREDENTIALS_PATH,
-            start_date=START_DATE,
-            end_date=END_DATE
-        )
-        with open(last_run_file, "w") as f:
-            f.write(end_date.strftime("%Y-%m-%d"))
+    run_etl_pipeline(
+        app_id=TIKTOK_APP_ID,
+        app_secret=TIKTOK_APP_SECRET,
+        access_token=TIKTOK_ACCESS_TOKEN,
+        advertiser_id=TIKTOK_ADVERTISER_ID,
+        project_id=PROJECT_ID,
+        dataset_id=DATASET_ID,
+        credentials_path=CREDENTIALS_PATH,
+        start_date=START_DATE,
+        end_date=END_DATE
+    )
