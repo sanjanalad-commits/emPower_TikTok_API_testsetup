@@ -19,7 +19,6 @@ class TikTokExtractor:
         self.base_url = "https://business-api.tiktok.com/open_api/v1.3"
 
     def extract_report_data(self, start_date: str, end_date: str) -> pd.DataFrame:
-        print(f"Extracting TikTok data from {start_date} to {end_date}...")
         all_chunks = []
         current_start = datetime.strptime(start_date, "%Y-%m-%d")
         end_date_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -35,7 +34,7 @@ class TikTokExtractor:
             params = {
                 "advertiser_id": self.advertiser_id,
                 "report_type": "BASIC",
-                "dimensions": '["ad_id","stat_time_day"]',
+                "dimensions": '["campaign_id","adgroup_id","ad_id","stat_time_day"]',
                 "metrics": '["spend","impressions","clicks","ctr","cpm","cpc","reach","frequency","video_play_actions","video_watched_2s","video_watched_6s","average_video_play"]',
                 "data_level": "AUCTION_AD",
                 "start_date": chunk_start,
@@ -152,7 +151,7 @@ class TikTokExtractor:
                 'AMOUNT_SPENT_USD': spend,
                 'VIDEO_VIEWS_AT_75': int(video_views * 0.75) if video_views else None,
                 'VIDEO_VIEWS_AT_25': video_2s if video_2s else None,
-                'CPR': round(spend / reach, 6) if reach and reach > 0 else None,
+                'CPR': round(spend / reach, 6) if reach > 0 else None,
                 'REACH': reach,
                 'CTR_DESTINATION': float(metrics.get("ctr", 0)),
                 'CURRENCY': "USD",
@@ -181,7 +180,6 @@ class TikTokExtractor:
 class DataTransformer:
     @staticmethod
     def transform(df: pd.DataFrame) -> pd.DataFrame:
-        print("Transforming data...")
         if df.empty:
             return df
         df = df.fillna({
@@ -219,7 +217,6 @@ class DataTransformer:
         for col, dtype in numeric_columns.items():
             if col in df.columns:
                 df[col] = df[col].astype(dtype)
-        print(f"Transformed {len(df)} rows")
         return df
 
 
@@ -242,18 +239,14 @@ class BigQueryLoader:
         delete_query = f"DELETE FROM `{table_id}` WHERE DATE IN ('{dates_str}')"
         try:
             self.client.query(delete_query).result()
-            print(f"Deleted existing rows for dates: {min(dates)} to {max(dates)}")
         except Exception as e:
-            if "Not found" in str(e):
-                print("Table does not exist yet")
-            else:
-                print(f"Warning: Could not delete existing dates: {e}")
+            if "Not found" not in str(e):
+                print(f"Warning deleting existing dates: {e}")
 
     def load_to_bigquery(self, df: pd.DataFrame, table_name: str = "TIKTOKREPORT_RAW"):
         if df.empty:
             print("No data to load")
             return
-        print(f"Loading data to BigQuery: {self.dataset_id}.{table_name}...")
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
         self.delete_existing_dates(df, table_name)
         job_config = bigquery.LoadJobConfig(
@@ -287,37 +280,19 @@ class BigQueryLoader:
                 bigquery.SchemaField("CAMPAIGN_NAME", "STRING"),
             ],
         )
-        job = self.client.load_table_from_dataframe(df, table_id, job_config=job_config)
-        job.result()
-        table = self.client.get_table(table_id)
-        print(f"Table now has {table.num_rows} total rows")
+        self.client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
 
 
-def run_etl_pipeline(
-    app_id: str,
-    app_secret: str,
-    access_token: str,
-    advertiser_id: str,
-    project_id: str,
-    dataset_id: str,
-    credentials_path: str,
-    start_date: str,
-    end_date: str
-):
-    print("Starting TikTok ETL Pipeline...")
-    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+def run_etl_pipeline(app_id, app_secret, access_token, advertiser_id, project_id, dataset_id, credentials_path, start_date, end_date):
     extractor = TikTokExtractor(app_id, app_secret, access_token, advertiser_id)
     raw_data = extractor.extract_report_data(start_date, end_date)
     if raw_data.empty:
-        print("No data extracted. Check credentials or date range.")
+        print("No data extracted")
         return
-    print("Preview of extracted data:")
-    print(raw_data.head(3).to_string())
     transformer = DataTransformer()
     transformed_data = transformer.transform(raw_data)
     loader = BigQueryLoader(project_id, dataset_id, credentials_path)
     loader.load_to_bigquery(transformed_data)
-    print("ETL pipeline completed successfully!")
 
 
 if __name__ == "__main__":
@@ -325,21 +300,36 @@ if __name__ == "__main__":
     TIKTOK_APP_SECRET = "01264ebfd0692d7c6556ab59992f2d292440977f"
     TIKTOK_ACCESS_TOKEN = "0417fb1524306e61a8a5d18426d5f6f4daebb5c6"
     TIKTOK_ADVERTISER_ID = "7480171442983141393"
+
     PROJECT_ID = "slstrategy"
     DATASET_ID = "empower_api_data"
     CREDENTIALS_PATH = "./service-account-key.json"
+
+    last_run_file = "./last_run.txt"
+    try:
+        with open(last_run_file, "r") as f:
+            last_run_date = datetime.strptime(f.read().strip(), "%Y-%m-%d")
+    except:
+        last_run_date = datetime(2025, 3, 3)
+
     end_date = datetime.now() - timedelta(days=1)
-    start_date = datetime(2025, 3, 3)
-    START_DATE = start_date.strftime("%Y-%m-%d")
-    END_DATE = end_date.strftime("%Y-%m-%d")
-    run_etl_pipeline(
-        app_id=TIKTOK_APP_ID,
-        app_secret=TIKTOK_APP_SECRET,
-        access_token=TIKTOK_ACCESS_TOKEN,
-        advertiser_id=TIKTOK_ADVERTISER_ID,
-        project_id=PROJECT_ID,
-        dataset_id=DATASET_ID,
-        credentials_path=CREDENTIALS_PATH,
-        start_date=START_DATE,
-        end_date=END_DATE
-    )
+    start_date = last_run_date + timedelta(days=1)
+
+    if start_date > end_date:
+        print("No new data to fetch")
+    else:
+        START_DATE = start_date.strftime("%Y-%m-%d")
+        END_DATE = end_date.strftime("%Y-%m-%d")
+        run_etl_pipeline(
+            app_id=TIKTOK_APP_ID,
+            app_secret=TIKTOK_APP_SECRET,
+            access_token=TIKTOK_ACCESS_TOKEN,
+            advertiser_id=TIKTOK_ADVERTISER_ID,
+            project_id=PROJECT_ID,
+            dataset_id=DATASET_ID,
+            credentials_path=CREDENTIALS_PATH,
+            start_date=START_DATE,
+            end_date=END_DATE
+        )
+        with open(last_run_file, "w") as f:
+            f.write(end_date.strftime("%Y-%m-%d"))
